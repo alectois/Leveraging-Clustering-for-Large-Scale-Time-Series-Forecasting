@@ -26,8 +26,13 @@ from src.forecasting.models         import (
     train_cluster_models,
     train_global_model,
     save_point_models,
+    select_best_elasticnet_params_by_backtest,
+    train_cluster_elasticnet_models,
+    train_global_elasticnet_model,
+    save_elasticnet_models,
 )
 from src.forecasting.predict        import predict_point
+from src.forecasting.predict_elasticnet import predict_elasticnet
 
 # ---------------------------------------------------------------------------
 # !! Update these to match notebook 03 selected k values !!
@@ -383,6 +388,282 @@ def run_global_pipeline(
         output_dir=RESULTS_DIR / "evaluation",
     )
 
+    return predictions
+
+
+# ===========================================================================
+# Elastic Net Pipelines
+# ===========================================================================
+
+def run_cluster_elasticnet_pipeline(
+    method: str,
+    k: int,
+    train_wide: pd.DataFrame,
+    test_wide: pd.DataFrame,
+    save_models: bool = True,
+    skip_tuning: bool = False,
+) -> pd.DataFrame:
+    """Train ElasticNet models per cluster, predict 2024, and evaluate.
+    
+    This pipeline follows the same structure as run_cluster_pipeline but uses
+    ElasticNet regression with feature scaling instead of LightGBM.
+    
+    Parameters
+    ----------
+    method      : "feature_ward" or "kshape".
+    k           : Number of regular clusters.
+    train_wide  : Wide 2023 DataFrame (households × 365 dates). Training only.
+    test_wide   : Wide 2024 DataFrame (households × 366 dates). Ground truth evaluation.
+    save_models : Whether to write model and scaler .pkl files.
+    skip_tuning : If True, use fixed default parameters (alpha=0.01, l1_ratio=0.5) instead of backtest tuning.
+                  This drastically reduces runtime from hours to ~30-40 minutes.
+    
+    Returns
+    -------
+    DataFrame of predictions saved to results/predictions/predictions_2024_{method}_elasticnet.csv
+    """
+    print(f"\n{'='*60}")
+    print(f"  {method}  (k={k}) - Elastic Net")
+    print(f"{'='*60}")
+    
+    cluster_series, regular_ids, cluster_labels = \
+        _load_and_intersect(DIAGNOSTICS_DIR, method, k, train_wide)
+    
+    print("\n[1/4] Building 2023 training features...")
+    (
+        train_feats,
+        feature_cols,
+        household_means,
+        cluster_dow_profile,
+        cluster_month_profile,
+    ) = prepare_features(
+        train_wide=train_wide,
+        regular_ids=regular_ids,
+        lag_features=LAG_FEATURES,
+        rolling_windows=ROLLING_WINDOWS,
+        cluster_series=cluster_series,
+    )
+    train_feats["cluster"] = train_feats["household_id"].map(cluster_series)
+    print(f"  Train: {train_feats.shape}")
+    print(f"  Features ({len(feature_cols)}): {feature_cols}")
+    
+    if skip_tuning:
+        print("\n[2/4] Using default ElasticNet parameters (FAST MODE - skipping tuning)...")
+        # Fixed parameters for fast execution: balanced L1/L2 mix with light regularization
+        default_params = {"alpha": 0.01, "l1_ratio": 0.5}
+        params_by_cluster = {label: default_params for label in cluster_labels}
+        global_best_params = default_params
+        print(f"  Using fixed params for all clusters: alpha={default_params['alpha']}, l1_ratio={default_params['l1_ratio']}")
+        print("  ⚡ This will save ~2.5-3 hours compared to full hyperparameter tuning!")
+    else:
+        print("\n[2/4] Selecting ElasticNet params with 2023-only walk-forward validation...")
+        
+        params_by_cluster = {}
+        backtest_tables = []
+        
+        for label in cluster_labels:
+            df_c = train_feats.loc[train_feats["cluster"] == label].copy()
+            print(f"\n  Cluster {label} ElasticNet backtest tuning")
+            best_params, backtest_df = select_best_elasticnet_params_by_backtest(
+                train_features_clean=df_c,
+                feature_cols=feature_cols,
+                random_seed=RANDOM_SEED,
+                n_splits=3,
+                validation_days=28,
+            )
+            backtest_df["scope"] = f"cluster_{label}"
+            params_by_cluster[label] = best_params
+            backtest_tables.append(backtest_df)
+        
+        print("\n  Global ElasticNet backtest tuning")
+        global_best_params, global_backtest_df = select_best_elasticnet_params_by_backtest(
+            train_features_clean=train_feats,
+            feature_cols=feature_cols,
+            random_seed=RANDOM_SEED,
+            n_splits=3,
+            validation_days=28,
+        )
+        global_backtest_df["scope"] = "global"
+        backtest_tables.append(global_backtest_df)
+        
+        backtest_results = pd.concat(backtest_tables, ignore_index=True)
+        backtest_path = RESULTS_DIR / "evaluation" / f"backtest_selection_{method}_elasticnet.csv"
+        backtest_path.parent.mkdir(parents=True, exist_ok=True)
+        backtest_results.to_csv(backtest_path, index=False)
+        print(f"\n  Saved 2023 backtest selection table: {backtest_path}")
+    
+    print("\n[3/4] Training ElasticNet models on full 2023 data...")
+    cluster_models, cluster_scalers = train_cluster_elasticnet_models(
+        train_feats,
+        feature_cols,
+        cluster_labels,
+        RANDOM_SEED,
+        params_by_cluster=params_by_cluster,
+    )
+    global_model, global_scaler = train_global_elasticnet_model(
+        train_feats,
+        feature_cols,
+        RANDOM_SEED,
+        alpha=global_best_params["alpha"],
+        l1_ratio=global_best_params["l1_ratio"],
+    )
+    
+    if save_models:
+        save_elasticnet_models(
+            cluster_models,
+            cluster_scalers,
+            global_model,
+            global_scaler,
+            RESULTS_DIR / "models" / f"{method}_elasticnet",
+        )
+    
+    print("\n[4/4] Predicting 2024 with ElasticNet...")
+    predictions = predict_elasticnet(
+        test_wide=test_wide,
+        train_wide=train_wide,
+        feature_cols=feature_cols,
+        lag_features=LAG_FEATURES,
+        rolling_windows=ROLLING_WINDOWS,
+        cluster_labels=cluster_labels,
+        cluster_models=cluster_models,
+        cluster_scalers=cluster_scalers,
+        global_model=global_model,
+        global_scaler=global_scaler,
+        cluster_series=cluster_series,
+        household_means=household_means,
+        cluster_dow_profile=cluster_dow_profile,
+        cluster_month_profile=cluster_month_profile,
+    )
+    
+    out_path = PREDICTIONS_DIR / f"predictions_2024_{method}_elasticnet.csv"
+    predictions.to_csv(out_path, index=False)
+    
+    n_hh = predictions["household_id"].nunique()
+    n_days = predictions.groupby("household_id").size()
+    print(f"\n  Saved predictions: {out_path}")
+    print(f"  Households: {n_hh:,}  |  Days per household: {n_days.min()}–{n_days.max()}")
+    
+    evaluate_predictions(
+        predictions=predictions,
+        test_wide=test_wide,
+        method_name=f"{method}_elasticnet",
+        output_dir=RESULTS_DIR / "evaluation",
+    )
+    
+    return predictions
+
+
+def run_global_elasticnet_pipeline(
+    train_wide: pd.DataFrame,
+    test_wide: pd.DataFrame,
+    save_models: bool = True,
+    skip_tuning: bool = False,
+) -> pd.DataFrame:
+    """Run the no-clustering Elastic Net baseline.
+    
+    Parameters
+    ----------
+    train_wide  : Wide 2023 training data.
+    test_wide   : Wide 2024 test data.
+    save_models : Whether to save models to disk.
+    skip_tuning : If True, use default params (alpha=0.01, l1_ratio=0.5) for fast execution.
+    """
+    print(f"\n{'='*60}")
+    print(f"  global baseline (no clustering) - Elastic Net")
+    print(f"{'='*60}")
+    
+    regular_ids = train_wide.index.intersection(test_wide.index)
+    global_cs = pd.Series(0, index=regular_ids, name="cluster")
+    
+    print("\n[1/4] Building 2023 training features...")
+    (
+        train_feats,
+        feature_cols,
+        household_means,
+        cluster_dow_profile,
+        cluster_month_profile,
+    ) = prepare_features(
+        train_wide=train_wide,
+        regular_ids=regular_ids,
+        lag_features=LAG_FEATURES,
+        rolling_windows=ROLLING_WINDOWS,
+        cluster_series=global_cs,
+    )
+    train_feats["cluster"] = 0
+    print(f"  Train: {train_feats.shape}")
+    
+    if skip_tuning:
+        print("\n[2/4] Using default ElasticNet parameters (FAST MODE - skipping tuning)...")
+        global_best_params = {"alpha": 0.01, "l1_ratio": 0.5}
+        print(f"  Using fixed params: alpha={global_best_params['alpha']}, l1_ratio={global_best_params['l1_ratio']}")
+        print("  ⚡ This will save ~30-50 minutes compared to full hyperparameter tuning!")
+    else:
+        print("\n[2/4] Selecting ElasticNet params with 2023-only walk-forward validation...")
+        global_best_params, global_backtest_df = select_best_elasticnet_params_by_backtest(
+            train_features_clean=train_feats,
+            feature_cols=feature_cols,
+            random_seed=RANDOM_SEED,
+            n_splits=3,
+            validation_days=28,
+        )
+        
+        backtest_path = RESULTS_DIR / "evaluation" / "backtest_selection_global_elasticnet.csv"
+        backtest_path.parent.mkdir(parents=True, exist_ok=True)
+        global_backtest_df.to_csv(backtest_path, index=False)
+        print(f"  Saved 2023 backtest selection table: {backtest_path}")
+    
+    print("\n[3/4] Training global ElasticNet model on full 2023 data...")
+    global_model, global_scaler = train_global_elasticnet_model(
+        train_feats,
+        feature_cols,
+        RANDOM_SEED,
+        alpha=global_best_params["alpha"],
+        l1_ratio=global_best_params["l1_ratio"],
+    )
+    
+    if save_models:
+        save_elasticnet_models(
+            {0: global_model},
+            {0: global_scaler},
+            global_model,
+            global_scaler,
+            RESULTS_DIR / "models" / "global_elasticnet",
+        )
+    
+    print("\n[4/4] Predicting 2024 with ElasticNet...")
+    predictions = predict_elasticnet(
+        test_wide=test_wide,
+        train_wide=train_wide,
+        feature_cols=feature_cols,
+        lag_features=LAG_FEATURES,
+        rolling_windows=ROLLING_WINDOWS,
+        cluster_labels=[0],
+        cluster_models={0: global_model},
+        cluster_scalers={0: global_scaler},
+        global_model=global_model,
+        global_scaler=global_scaler,
+        cluster_series=global_cs,
+        household_means=household_means,
+        cluster_dow_profile=cluster_dow_profile,
+        cluster_month_profile=cluster_month_profile,
+    )
+    predictions.loc[predictions["cluster"] == 0, "model_used"] = "global_elasticnet"
+    
+    out_path = PREDICTIONS_DIR / "predictions_2024_global_elasticnet.csv"
+    predictions.to_csv(out_path, index=False)
+    
+    n_hh = predictions["household_id"].nunique()
+    n_days = predictions.groupby("household_id").size()
+    print(f"\n  Saved predictions: {out_path}")
+    print(f"  Households: {n_hh:,}  |  Days per household: {n_days.min()}–{n_days.max()}")
+    
+    evaluate_predictions(
+        predictions=predictions,
+        test_wide=test_wide,
+        method_name="global_elasticnet",
+        output_dir=RESULTS_DIR / "evaluation",
+    )
+    
     return predictions
 
 
